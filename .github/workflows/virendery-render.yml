@@ -1,0 +1,55 @@
+# Installed by Virendery (admin → Cloud Run → GitHub). Each run renders one part of a video:
+# it fetches its job from the Virendery API with the VIRENDERY_KEY secret, starts the render
+# container and hands it the job. The container reports progress and the result to the API.
+name: Virendery render
+run-name: Render ${{ inputs.part }}
+on:
+  workflow_dispatch:
+    inputs:
+      part:
+        description: Render part id
+        required: true
+      api:
+        description: Virendery API address
+        required: true
+permissions: {}
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      PART: ${{ inputs.part }}
+      API: ${{ inputs.api }}
+    steps:
+      - name: Fetch the job
+        env:
+          KEY: ${{ secrets.VIRENDERY_KEY }}
+        run: |
+          curl -fsS --retry 3 -X POST -H "authorization: Bearer $KEY" "$API/api/render/cloud/parts/$PART/github-job" -o job.json
+          echo "::add-mask::$(jq -r .body.callback.token job.json)"
+          echo "kind: $(jq -r .path job.json) · image: $(jq -r .image job.json)"
+      - name: Start the renderer
+        run: |
+          IMAGE=$(jq -r .image job.json)
+          TOKEN=$(openssl rand -hex 24)
+          echo "::add-mask::$TOKEN"
+          echo "RENDER_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          time docker pull -q "$IMAGE"
+          docker run -d --name render -p 8080:8080 -e PORT=8080 -e RENDER_TOKEN="$TOKEN" "$IMAGE"
+          for i in $(seq 1 60); do curl -fsS localhost:8080/ && exit 0; sleep 1; done
+          exit 1
+      - name: Render
+        run: |
+          jq -c .body job.json > body.json
+          curl -sS --max-time 4200 -X POST -H "authorization: Bearer $RENDER_TOKEN" -H 'content-type: application/json' \
+            --data-binary @body.json "localhost:8080/$(jq -r .path job.json)" -o out.json -w 'HTTP %{http_code}\n'
+          jq -r '"status: \(.status) · render \(.renderMs // 0) ms · upload \(.uploadBytes // 0) bytes"' out.json
+          test "$(jq -r .status out.json)" = done
+      - name: Renderer log
+        if: failure()
+        run: docker logs render 2>&1 | sed -E 's/\?[^" ]*/?…/g' | tail -100 || true
+      - name: Give the part back
+        if: failure() || cancelled()
+        run: |
+          [ -f job.json ] || exit 0
+          curl -sS -X POST -H "authorization: Bearer $(jq -r .body.callback.token job.json)" "$(jq -r .body.callback.url job.json)/lost" || true
